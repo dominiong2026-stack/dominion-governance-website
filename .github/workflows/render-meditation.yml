@@ -29,11 +29,12 @@ jobs:
       - name: Render and master
         run: |
           cat > render.py <<'PY'
-          import re, math
+          import re
           from pathlib import Path
           import numpy as np
           import soundfile as sf
           from scipy.signal import butter, sosfilt
+          from scipy.ndimage import uniform_filter1d
           from kokoro_onnx import Kokoro
 
           SR=24000
@@ -65,51 +66,46 @@ jobs:
                   chunks.append(a)
           voice=np.concatenate(chunks)
 
-          # gentle voice cleanup
           sos=butter(2,70,btype='highpass',fs=SR,output='sos')
           voice=sosfilt(sos,voice).astype(np.float32)
           peak=np.max(np.abs(voice)) or 1.0
           voice=voice*(0.78/peak)
           sf.write('narration.wav',voice,SR,subtype='PCM_24')
 
-          # target 17 min or narration+25 sec, whichever is longer
           dur=max(17*60, len(voice)/SR + 25)
           n=int(dur*SR)
           t=np.arange(n,dtype=np.float32)/SR
-          # binaural separation: 10 Hz -> 7.5 -> 6 -> 8.5
-          bp=np.empty(n,dtype=np.float32)
-          for i,tt in enumerate(t):
-              if tt<180: d=10-(2.5*tt/180)
-              elif tt<420: d=7.5-(1.5*(tt-180)/240)
-              elif tt<840: d=6.0
-              else: d=6.0+2.5*min(1,(tt-840)/180)
-              bp[i]=d
+
+          bp=np.where(t<180,
+                      10-(2.5*t/180),
+                      np.where(t<420,
+                               7.5-(1.5*(t-180)/240),
+                               np.where(t<840,
+                                        6.0,
+                                        6.0+2.5*np.minimum(1,(t-840)/180)))).astype(np.float32)
           carrier=174.0
           phaseL=2*np.pi*carrier*t
           phaseR=2*np.pi*(carrier+bp)*t
           binaural=np.stack([np.sin(phaseL),np.sin(phaseR)],axis=1)*0.018
-          # warm harmonic drone with very slow breathing envelope
+
           env=0.55+0.45*np.sin(2*np.pi*t/22.0)**2
           drone=(0.55*np.sin(2*np.pi*87.0*t)+0.28*np.sin(2*np.pi*130.5*t)+0.17*np.sin(2*np.pi*261.0*t))*env
           drone=np.stack([drone,drone],axis=1)*0.024
           bed=(binaural+drone).astype(np.float32)
-          fade=int(8*SR)
+          fade=min(int(8*SR),n//2)
           ramp=np.linspace(0,1,fade,dtype=np.float32)
           bed[:fade]*=ramp[:,None]
           bed[-fade:]*=ramp[::-1,None]
 
-          # narration stereo + gentle ducking beneath speech
           vst=np.zeros((n,2),dtype=np.float32)
           L=min(len(voice),n)
           vst[:L,0]=voice[:L]; vst[:L,1]=voice[:L]
-          # activity envelope from absolute voice, smoothed ~120ms
+
           act=np.zeros(n,dtype=np.float32); act[:L]=np.abs(voice[:L])
-          win=max(1,int(.12*SR)); ker=np.ones(win,dtype=np.float32)/win
-          sm=np.convolve(act,ker,mode='same')
+          sm=uniform_filter1d(act,size=max(1,int(.12*SR)),mode='nearest')
           sm=np.clip(sm/0.09,0,1)
           duck=(1-0.48*sm)[:,None]
           mix=vst + bed*duck
-          # master conservatively
           p=np.max(np.abs(mix)) or 1.0
           mix*=min(1.0,0.76/p)
           sf.write('Friend_of_Mammon_Tonglen_Neural_FINAL.wav',mix,SR,subtype='PCM_24')
